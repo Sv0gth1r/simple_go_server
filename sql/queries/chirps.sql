@@ -10,7 +10,10 @@ VALUES (
 RETURNING *;
 
 -- name: DeleteAllChirpsFromUser :exec
-DELETE FROM chirps WHERE id LIKE $1;
+DELETE FROM chirps WHERE user_id = $1;
+
+-- name: DeleteChirpFromChirpId :exec
+DELETE FROM chirps WHERE id = $1;
 
 -- name: GetAllChirpsOrderedByCreationDate :many
 SELECT * FROM chirps ORDER BY created_at;

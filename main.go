@@ -15,12 +15,14 @@ import(
 	"os"
 	"time"
 	"errors"
+	"context"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries *database.Queries
 	platform string
+	secret string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -59,7 +61,7 @@ func filter_profanity(str string) string {
 
 func validateChirp(str string) (string, error) {
 	var clean_str string
-	if len(str) > 140 {
+if len(str) > 140 {
 		log.Printf("Request Error: Chirp too long")
 		err := errors.New("Chirp is too long")
 		return clean_str, err
@@ -73,7 +75,6 @@ func validateChirp(str string) (string, error) {
 func (cfg *apiConfig)handle_chirps(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
 		Body string `json:"body"`
-		UserID uuid.NullUUID `json:"user_id"`
 	}
 	type response struct {
 		ID uuid.UUID `json:"id"`
@@ -83,6 +84,7 @@ func (cfg *apiConfig)handle_chirps(w http.ResponseWriter, r *http.Request) {
 		UserID uuid.NullUUID `json:"user_id"`
 	}
 	decoder := json.NewDecoder(r.Body)
+	headers := r.Header
 	params := parameters{}
 	res := response{}
 	err := decoder.Decode(&params)
@@ -97,6 +99,17 @@ func (cfg *apiConfig)handle_chirps(w http.ResponseWriter, r *http.Request) {
 		w.Write(dat)
 		return
 	}
+	token, err := auth.GetBearerToken(headers)
+	if err != nil {
+		log.Printf("Error fetching the token: %v\n", err)
+		return
+	}
+	id, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		log.Printf("Error validating token: %v\n", err)
+		w.WriteHeader(401)
+		return
+	}
 	res.Body, err = validateChirp(params.Body)
 	if err != nil {
 		w.WriteHeader(500)
@@ -105,8 +118,9 @@ func (cfg *apiConfig)handle_chirps(w http.ResponseWriter, r *http.Request) {
 	} else {
 		chirpParam := database.CreateChirpParams{
 			Body : res.Body,
-			UserID : params.UserID,
+			UserID : uuid.NullUUID{UUID:id, Valid:true,},
 		}
+		log.Printf("Create chirp with userID: %v\n", chirpParam.UserID)
 		chirp, err := cfg.dbQueries.CreateChirp(r.Context(), chirpParam)
 		if err != nil {
 			w.WriteHeader(500)
@@ -117,7 +131,8 @@ func (cfg *apiConfig)handle_chirps(w http.ResponseWriter, r *http.Request) {
 		res.UpdatedAt = chirp.UpdatedAt
 		res.CreatedAt = chirp.CreatedAt
 		res.Body = chirp.Body
-		res.UserID = chirp.UserID
+		res.UserID = uuid.NullUUID{UUID: id, Valid: true,}
+		log.Printf("Respond with user_id: %v\n", id)
 	}
 	dat, err := json.Marshal(res)
 	if err != nil {
@@ -257,6 +272,46 @@ func (cfg *apiConfig)fetch_chirp(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Error while writing: %v\n", err)
 	}
 }
+
+func (cfg *apiConfig)delete_chirp(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error fetching the token: %v\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		log.Printf("Error validating token: %v\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	uuid, err := uuid.Parse(r.PathValue("chirpID"))
+	if err != nil {
+		log.Printf("Error while parsing argument chirpID: %v\n", err)
+		w.WriteHeader(500)
+		return
+	}
+	chirp, err := cfg.dbQueries.GetChirpById(r.Context(), uuid)
+	if err != nil {
+		log.Printf("Error fetching chirp: %v\n", err)
+		return
+	}
+	if chirp.UserID.UUID != userID {
+		log.Printf("Error: User with ID:%v is not author of the chirp (author id: %v)\n", userID, chirp.UserID)
+		w.WriteHeader(403)
+		return
+	}
+	err = cfg.dbQueries.DeleteChirpFromChirpId(r.Context(), uuid)
+	if err != nil {
+		log.Printf("Error fetching chirp: %v\n", err)
+		w.WriteHeader(404)
+		return
+	}
+	w.WriteHeader(204)
+	return
+}
+
 func (cfg *apiConfig)fetch_chirps(w http.ResponseWriter, r *http.Request) {
 	type chirp struct {
 		ID uuid.UUID `json:"id"`
@@ -308,6 +363,8 @@ func (cfg *apiConfig)handle_login(w http.ResponseWriter, r *http.Request) {
 		CreatedAt time.Time `json:"created_at"`
 		UpdatedAt time.Time `json:"updated_at"`
 		Email string `json:"email"`
+		Token string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
@@ -327,7 +384,7 @@ func (cfg *apiConfig)handle_login(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := cfg.dbQueries.GetUserFromEmail(r.Context(), params.Email)
 	if err != nil {
-		log.Printf("Error fetching hashed pwd: %v\n", err)
+		log.Printf("Error fetching user: %v\n", err)
 		return
 	}
 	match, err := auth.CheckPasswordHash(params.Password, user.HashedPassword)
@@ -336,11 +393,28 @@ func (cfg *apiConfig)handle_login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if match == true {
+		token, err := auth.MakeJWT(user.ID, cfg.secret)
+		if err != nil {
+			log.Printf("Error creating Token: %v\n", err)
+			return
+		}
+		refresh_token := database.CreateRefreshTokenParams {
+			Token: auth.MakeRefreshToken(),
+			UserID: user.ID,
+			ExpiresAt: time.Now().UTC().Add(time.Hour * 24 * 60),
+		}
+		_, err = cfg.dbQueries.CreateRefreshToken(r.Context(), refresh_token)
+		if err != nil {
+			log.Printf("Error creating refresh_token in db: %v\n", err)
+			return
+		}
 		res := response{
 			ID: user.ID,
 			CreatedAt: user.CreatedAt,
 			UpdatedAt: user.UpdatedAt,
 			Email: user.Email,
+			Token: token,
+			RefreshToken: refresh_token.Token,
 		}
 		w.WriteHeader(200)
 		w.Header().Set("Content-Type", "application/json")
@@ -363,12 +437,141 @@ func (cfg *apiConfig)handle_login(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
+func (cfg *apiConfig)refresh_token(w http.ResponseWriter, r *http.Request) {
+	type response struct {
+		Token string `json:"token"`
+	}
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error getting bearer token: %v\n", err)
+		return
+	}
+	tokenStruct, err := cfg.dbQueries.GetRefreshToken(context.Background(), token)
+	if err != nil {
+		log.Printf("Error fetching refresh token %v: %v\n", token, err)
+		w.WriteHeader(401)
+		return
+	}
+	if tokenStruct.RevokedAt.Valid == true {
+		log.Printf("token %v is revoked\n", token)
+		w.WriteHeader(401)
+		return
+	}
+	jwToken, err := auth.MakeJWT(tokenStruct.UserID, cfg.secret)
+	res := response{
+		Token: jwToken,
+	}
+	w.WriteHeader(200)
+	dat, err := json.Marshal(res)
+	_, err = w.Write(dat)
+	if err != nil {
+		log.Printf("Error while writing: %v\n", err)
+	}
+	return
+}
+
+func (cfg *apiConfig)revoke_token(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error getting bearer token: %v\n", err)
+		return
+	}
+	_, err = cfg.dbQueries.GetRefreshToken(context.Background(), token)
+	if err != nil {
+		log.Printf("Error fetching refresh token %v: %v\n", token, err)
+		w.WriteHeader(401)
+		return
+	}
+	cfg.dbQueries.RevokeToken(context.Background(), token)
+	w.WriteHeader(204)
+	return
+}
+
+func (cfg *apiConfig)update_user(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		NewPassword string `json:"password"`
+		NewEmail string `json:"email"`
+	}
+	type response struct {
+		ID uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email string `json:"email"`
+	}
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("Error fetching the token: %v\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	id, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		log.Printf("Error validating token: %v\n", err)
+		w.WriteHeader(401)
+		return
+	}
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		log.Printf("Error decoding parameters: %s\n", err)
+		w.WriteHeader(500)
+		return
+	}
+	pwd, err := auth.HashPassword(params.NewPassword)
+	if err != nil {
+		log.Printf("Error hashing password: %v\n", err)
+		return
+	}
+	pwdUpdateStruct := database.EditUserPwdParams {
+		ID: id,
+		HashedPassword: pwd,
+	}
+	err = cfg.dbQueries.EditUserPwd(r.Context(), pwdUpdateStruct)
+	if err != nil {
+		log.Printf("Error updating password: %s\n", err)
+		return
+	}
+	mailUpdateStruct := database.EditUserEmailParams {
+		ID: id,
+		Email: params.NewEmail,
+	}
+	err = cfg.dbQueries.EditUserEmail(r.Context(), mailUpdateStruct)
+	if err != nil {
+		log.Printf("Error updating email: %s\n", err)
+		return
+	}
+	user, err := cfg.dbQueries.GetUserFromEmail(r.Context(), params.NewEmail)
+	if err != nil {
+		log.Printf("Error fetching user: %v\n", err)
+		return
+	}
+	res := response{
+		ID: user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email: user.Email,
+	}
+	w.WriteHeader(200)
+	w.Header().Set("Content-Type", "application/json")
+	dat, err := json.Marshal(res)
+	if err != nil {
+		log.Printf("Error marshalling JSON: %s\n", err)
+		return
+	}
+	_, err = w.Write(dat)
+	if err != nil {
+		log.Printf("Error while writing: %v\n", err)
+	}
+	return
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
-		log.Print("Error opening database: %v\n", err)
+		log.Printf("Error opening database: %v\n", err)
 		return
 	}
 	serveMux := http.NewServeMux()
@@ -377,6 +580,7 @@ func main() {
 	var apiCfg apiConfig
 	apiCfg.dbQueries = database.New(db)
 	apiCfg.platform = os.Getenv("PLATFORM")
+	apiCfg.secret = os.Getenv("SECRET")
 
 	serveMux.Handle("/app/", apiCfg.middlewareMetricsInc(handler))
 	serveMux.HandleFunc("GET /api/healthz", handle_healthz)
@@ -387,6 +591,10 @@ func main() {
 	serveMux.HandleFunc("POST /api/chirps", apiCfg.handle_chirps)
 	serveMux.HandleFunc("GET /api/chirps", apiCfg.fetch_chirps)
 	serveMux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.fetch_chirp)
+	serveMux.HandleFunc("POST /api/refresh", apiCfg.refresh_token)
+	serveMux.HandleFunc("POST /api/revoke", apiCfg.revoke_token)
+	serveMux.HandleFunc("PUT /api/users", apiCfg.update_user)
+	serveMux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.delete_chirp)
 	server.Addr = ":8080"
 	server.Handler = serveMux
 

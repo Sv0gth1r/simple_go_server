@@ -17,3 +17,13 @@ SELECT hashed_password FROM users WHERE email = $1;
 
 -- name: GetUserFromEmail :one
 SELECT * FROM users WHERE email = $1;
+
+-- name: EditUserPwd :exec
+UPDATE users 
+SET updated_at=NOW(), hashed_password=$1
+WHERE id = $2;
+
+-- name: EditUserEmail :exec
+UPDATE users 
+SET updated_at=NOW(), email=$1
+WHERE id = $2;

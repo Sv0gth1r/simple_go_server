@@ -7,6 +7,8 @@ package database
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const createUser = `-- name: CreateUser :one
@@ -45,6 +47,38 @@ DELETE FROM users WHERE id IS NOT NULL
 
 func (q *Queries) DeleteAllUsers(ctx context.Context) error {
 	_, err := q.db.ExecContext(ctx, deleteAllUsers)
+	return err
+}
+
+const editUserEmail = `-- name: EditUserEmail :exec
+UPDATE users 
+SET updated_at=NOW(), email=$1
+WHERE id = $2
+`
+
+type EditUserEmailParams struct {
+	Email string
+	ID    uuid.UUID
+}
+
+func (q *Queries) EditUserEmail(ctx context.Context, arg EditUserEmailParams) error {
+	_, err := q.db.ExecContext(ctx, editUserEmail, arg.Email, arg.ID)
+	return err
+}
+
+const editUserPwd = `-- name: EditUserPwd :exec
+UPDATE users 
+SET updated_at=NOW(), hashed_password=$1
+WHERE id = $2
+`
+
+type EditUserPwdParams struct {
+	HashedPassword string
+	ID             uuid.UUID
+}
+
+func (q *Queries) EditUserPwd(ctx context.Context, arg EditUserPwdParams) error {
+	_, err := q.db.ExecContext(ctx, editUserPwd, arg.HashedPassword, arg.ID)
 	return err
 }
 
